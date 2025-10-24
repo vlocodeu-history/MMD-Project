@@ -413,39 +413,43 @@ def render_admin_library():
         #   id, created_at, actor_user_id, actor_username, actor_role,
         #   action, entity_type, entity_id, name, details (json/text), ip_addr
         where = ["1=1"]
-        params: Dict[str, Any] = {"lim": int(limit)}
-        if f_user.strip():
-            where.append("(al.actor_username ILIKE :uname)")
-            params["uname"] = f"%{f_user.strip()}%"
-        if f_role != "(any)":
-            where.append("al.actor_role = :role")
-            params["role"] = f_role
-        if f_entity != "(any)":
-            where.append("al.entity_type = :etype")
-            params["etype"] = f_entity
-        if f_action != "(any)":
-            where.append("al.action = :action")
-            params["action"] = f_action
+        params = {"lim": int(limit)}
 
-        order_sql = "DESC" if order_desc else "ASC"
+        if f_user.strip():
+            where.append("al.actor_username ILIKE :uname")
+            params["uname"] = f"%{f_user.strip()}%"
+
+        if f_role != "(any)":
+            where.append("lower(al.actor_role) = :role")
+            params["role"] = f_role.lower()
+
+        if f_entity != "(any)":
+            where.append("lower(al.entity_type) = :etype")
+            params["etype"] = f_entity.lower()
+
+        if f_action != "(any)":
+            where.append("lower(al.action) = :action")
+            params["action"] = f_action.lower()
+
         sql = f"""
             SELECT
-              al.id::text            AS id,
-              al.created_at          AS created_at,
-              al.actor_user_id::text AS actor_user_id,
-              al.actor_username      AS actor_username,
-              al.actor_role          AS actor_role,
-              al.action              AS action,
-              al.entity_type         AS entity_type,
-              al.entity_id::text     AS entity_id,
-              al.name                AS name,
-              al.details             AS details,
-              al.ip_addr             AS ip_addr
-            FROM audit_logs al
+            al.id::text            AS id,
+            al.created_at          AS created_at,
+            al.actor_user_id::text AS actor_user_id,
+            al.actor_username      AS actor_username,
+            al.actor_role          AS actor_role,
+            al.action              AS action,
+            al.entity_type         AS entity_type,
+            al.entity_id::text     AS entity_id,
+            al.name                AS name,
+            al.details             AS details,
+            al.ip_addr             AS ip_addr
+            FROM public.audit_logs al
             WHERE {" AND ".join(where)}
-            ORDER BY al.created_at {order_sql}
+            ORDER BY al.created_at {"DESC" if order_desc else "ASC"}
             LIMIT :lim
         """
+
 
         if btn or "admin_cache_audit" not in st.session_state:
             try:

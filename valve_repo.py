@@ -1,8 +1,8 @@
-# valve_repo.py  — with audit logging aligned to dc001_repo.py improvements
+# valve_repo.py — with audit logging aligned to dc001_repo.py improvements
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
-import json
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
+from sqlalchemy.dialects.postgresql import JSONB
 from db import connect
 from audit import log_on_conn
 
@@ -32,18 +32,25 @@ def _diff_top_level(old_data: Dict[str, Any] | None, new_data: Dict[str, Any] | 
 # -----------------------
 
 def create_valve_design(user_id: str, name: str, payload: Dict[str, Any]) -> str:
+    """
+    Inserts a valve_design with JSONB payload. Uses JSONB bindparam to adapt dict -> jsonb.
+    """
     clean_name = (name or "").strip() or "Untitled"
+    insert_sql = text(
+        """
+        INSERT INTO valve_designs (user_id, name, data)
+        VALUES (:uid, :name, :data)
+        RETURNING id::text
+        """
+    ).bindparams(bindparam("data", type_=JSONB))
+
     with connect() as conn:
         new_id = conn.execute(
-            text("""
-                INSERT INTO valve_designs (user_id, name, data)
-                VALUES (:uid, :name, :data)
-                RETURNING id::text
-            """),
+            insert_sql,
             {"uid": user_id, "name": clean_name, "data": payload},
         ).scalar()
 
-        # AUDIT (same style as dc001, keep a compact summary)
+        # AUDIT (compact summary)
         try:
             log_on_conn(
                 conn,
@@ -66,13 +73,15 @@ def create_valve_design(user_id: str, name: str, payload: Dict[str, Any]) -> str
 def list_valve_designs(user_id: str, limit: int = 200):
     with connect() as conn:
         rows = conn.execute(
-            text("""
+            text(
+                """
                 SELECT id::text, name, created_at, updated_at
                 FROM valve_designs
                 WHERE user_id = :uid
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT :lim
-            """),
+                """
+            ),
             {"uid": user_id, "lim": limit},
         ).fetchall()
     return [(r[0], r[1], r[2], r[3]) for r in rows]
@@ -80,11 +89,13 @@ def list_valve_designs(user_id: str, limit: int = 200):
 def get_valve_design(design_id: str, user_id: str) -> dict | None:
     with connect() as conn:
         r = conn.execute(
-            text("""
+            text(
+                """
                 SELECT id::text, name, data, created_at, updated_at
                 FROM valve_designs
                 WHERE id = :id AND user_id = :uid
-            """),
+                """
+            ),
             {"id": design_id, "uid": user_id},
         ).mappings().first()
     if not r:
@@ -103,17 +114,20 @@ def update_valve_design(
     user_id: str,
     *,
     name: Optional[str] = None,
-    data: Optional[Dict[str, Any]] = None
+    data: Optional[Dict[str, Any]] = None,
 ) -> bool:
     sets: List[str] = []
     params: Dict[str, Any] = {"id": design_id, "uid": user_id}
 
+    binders = {}
     if name is not None:
         params["name"] = (name or "").strip() or "Untitled"
         sets.append("name = :name")
     if data is not None:
         params["data"] = data
         sets.append("data = :data")
+        binders["data"] = bindparam("data", type_=JSONB)
+
     if not sets:
         return False
 
@@ -124,31 +138,31 @@ def update_valve_design(
             {"id": design_id, "uid": user_id},
         ).mappings().one_or_none()
 
-        res = conn.execute(
-            text(f"UPDATE valve_designs SET {', '.join(sets)} WHERE id = :id AND user_id = :uid"),
-            params,
-        )
+        upd_stmt = text(f"UPDATE valve_designs SET {', '.join(sets)}, updated_at = now() WHERE id = :id AND user_id = :uid")
+        # apply JSONB binder if needed
+        if binders:
+            for _k, _b in binders.items():
+                upd_stmt = upd_stmt.bindparams(_b)
+
+        res = conn.execute(upd_stmt, params)
         ok = (res.rowcount or 0) > 0
 
         if ok:
             try:
-                # Build compact diff similar to dc001_repo approach
-                old_name = old.get("name") if old else None
+                old_name = (old or {}).get("name")
                 new_name = params.get("name", old_name)
                 name_diff = _diff_name(old_name, new_name)
 
-                old_data = old.get("data") if old else None
+                old_data = (old or {}).get("data")
                 new_data = params.get("data") if "data" in params else old_data
                 top_level_diff = _diff_top_level(old_data, new_data)
 
-                changes = {}
+                changes: Dict[str, Any] = {}
                 changes.update(name_diff)
                 if top_level_diff:
                     changes["data"] = top_level_diff
 
-                # Ensure we always log a name (fallback to old if not provided)
                 nm_for_log = new_name or old_name
-
                 log_on_conn(
                     conn,
                     "UPDATE",
@@ -164,7 +178,7 @@ def update_valve_design(
 
 def delete_valve_design(design_id: str, user_id: str) -> bool:
     with connect() as conn:
-        # Prefetch name BEFORE delete so it appears in the audit log (like dc001_repo)
+        # Prefetch name BEFORE delete for audit
         try:
             name_before = conn.execute(
                 text("SELECT name FROM valve_designs WHERE id = :id AND user_id = :uid"),
@@ -229,7 +243,8 @@ def list_all_valve_designs(
 def get_valve_design_with_user(design_id: str) -> Optional[Dict[str, Any]]:
     with connect() as conn:
         row = conn.execute(
-            text("""
+            text(
+                """
                 SELECT
                     vd.id::text AS id,
                     u.username  AS username,
@@ -240,7 +255,8 @@ def get_valve_design_with_user(design_id: str) -> Optional[Dict[str, Any]]:
                 FROM valve_designs vd
                 JOIN users u ON u.id = vd.user_id
                 WHERE vd.id = :id
-            """),
+                """
+            ),
             {"id": design_id},
         ).mappings().one_or_none()
         return dict(row) if row else None

@@ -6,10 +6,20 @@ import importlib
 from urllib.parse import urlencode, quote
 from auth import login_form, register_form, validate_token, logout_now
 
+
 # --- make sure project root, modules/, and pages/ are importable ---
 import sys
 from pathlib import Path
+# from sqlalchemy import text
+# from db import connect
 
+# st.info("DB sanity probe")
+# with connect() as c:
+#     db = c.execute(text("select current_database()")).scalar()
+#     sch = c.execute(text("select current_schema()")).scalar()
+#     cnt = c.execute(text("select count(*) from public.valve_designs")).scalar()
+#     st.write({"current_database": db, "current_schema": sch, "valve_designs_count": cnt})
+    
 ROOT = Path(__file__).resolve().parent
 for p in (ROOT, ROOT / "modules", ROOT / "pages"):
     sp = str(p)

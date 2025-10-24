@@ -1,12 +1,61 @@
-# dc008_repo.py — with audit logging like dc001_repo.py
+# dc008_repo.py — psycopg2-safe JSONB writes + optional design_id + public schema
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
-from sqlalchemy import text
+from typing import Any, Dict, List, Optional, Tuple
+from sqlalchemy import text, bindparam
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import ProgrammingError, DBAPIError
 from db import connect
 from audit import log_on_conn
+import json
 
-TABLE  = "dc008_calcs"
+TABLE  = "public.dc008_calcs"
 ENTITY = "dc008"
+
+# --- schema probe cache ---
+_has_design_id_cache: Optional[bool] = None
+def _has_design_id(conn) -> bool:
+    global _has_design_id_cache
+    if _has_design_id_cache is not None:
+        return _has_design_id_cache
+    row = conn.execute(text("""
+        select exists (
+          select 1
+          from information_schema.columns
+          where table_schema = 'public'
+            and table_name   = 'dc008_calcs'
+            and column_name  = 'design_id'
+        )
+    """)).scalar()
+    _has_design_id_cache = bool(row)
+    return _has_design_id_cache
+
+def _insert_stmt(with_design: bool):
+    if with_design:
+        return text(f"""
+            INSERT INTO {TABLE} (user_id, design_id, name, data)
+            VALUES (:uid, :design_id, :name, :data)
+            RETURNING id::text
+        """).bindparams(bindparam("data", type_=JSONB))
+    else:
+        return text(f"""
+            INSERT INTO {TABLE} (user_id, name, data)
+            VALUES (:uid, :name, :data)
+            RETURNING id::text
+        """).bindparams(bindparam("data", type_=JSONB))
+
+def _insert_stmt_fallback(with_design: bool):
+    if with_design:
+        return text(f"""
+            INSERT INTO {TABLE} (user_id, design_id, name, data)
+            VALUES (:uid, :design_id, :name, (:data_text)::jsonb)
+            RETURNING id::text
+        """)
+    else:
+        return text(f"""
+            INSERT INTO {TABLE} (user_id, name, data)
+            VALUES (:uid, :name, (:data_text)::jsonb)
+            RETURNING id::text
+        """)
 
 # -------------------------------------------------------------------
 # Create
@@ -17,37 +66,31 @@ def create_dc008_calc(
     payload: Dict[str, Any],
     design_id: Optional[str] = None,
 ) -> str:
-    """
-    Insert a DC008 calculation. `payload` is a Python dict (JSONB).
-    If `design_id` is provided, link to a valve design.
-    Returns new row id (uuid::text).
-    """
     clean_name = (name or "DC008").strip() or "DC008"
-    sql = f"""
-        INSERT INTO {TABLE} (user_id, design_id, name, data)
-        VALUES (:uid, :design_id, :name, :data)
-        RETURNING id::text
-    """
     with connect() as conn:
-        rid = conn.execute(
-            text(sql),
-            {
-                "uid": user_id,
-                "design_id": design_id,
-                "name": clean_name,
-                "data": payload,   # SQLAlchemy binds JSON/JSONB correctly
-            },
-        ).scalar()
+        use_design = _has_design_id(conn) and (design_id is not None)
 
-        # AUDIT (compact summary if available)
+        # Preferred: JSONB bind
         try:
-            base = (payload or {}).get("base", {})
+            stmt = _insert_stmt(use_design)
+            params = {"uid": user_id, "name": clean_name, "data": payload}
+            if use_design:
+                params["design_id"] = design_id
+            rid = conn.execute(stmt, params).scalar()
+        except (ProgrammingError, DBAPIError, TypeError):
+            # Fallback: serialize->::jsonb cast
+            stmt = _insert_stmt_fallback(use_design)
+            params = {"uid": user_id, "name": clean_name, "data_text": json.dumps(payload)}
+            if use_design:
+                params["design_id"] = design_id
+            rid = conn.execute(stmt, params).scalar()
+
+        # AUDIT (compact summary)
+        try:
+            base = (payload or {}).get("base", {}) or {}
             log_on_conn(
-                conn,
-                "CREATE",
-                ENTITY,
-                entity_id=rid,
-                name=clean_name,
+                conn, "create", ENTITY,
+                entity_id=rid, name=clean_name,
                 details={"summary": {
                     "nps_in": base.get("nps_in"),
                     "asme_class": base.get("asme_class"),
@@ -57,13 +100,12 @@ def create_dc008_calc(
         except Exception:
             pass
 
-        return rid  # already text
-
+        return str(rid)
 
 # -------------------------------------------------------------------
 # Read (user-scoped)
 # -------------------------------------------------------------------
-def list_dc008_calcs(user_id: str, limit: int = 200):
+def list_dc008_calcs(user_id: str, limit: int = 200) -> List[Tuple[str, str, Any, Any]]:
     with connect() as conn:
         rows = conn.execute(
             text(f"""
@@ -77,12 +119,12 @@ def list_dc008_calcs(user_id: str, limit: int = 200):
         ).fetchall()
     return [(r[0], r[1], r[2], r[3]) for r in rows]
 
-
-def get_dc008_calc(calc_id: str, user_id: str) -> dict | None:
+def get_dc008_calc(calc_id: str, user_id: str) -> Optional[Dict[str, Any]]:
     with connect() as conn:
         r = conn.execute(
             text(f"""
-                SELECT id::text, name, data, created_at, updated_at, design_id::text AS design_id
+                SELECT id::text, name, data, created_at, updated_at,
+                       design_id::text AS design_id
                 FROM {TABLE}
                 WHERE id = :id AND user_id = :uid
             """),
@@ -100,7 +142,6 @@ def get_dc008_calc(calc_id: str, user_id: str) -> dict | None:
     }
     return out
 
-
 # -------------------------------------------------------------------
 # Update / Delete (user-scoped)
 # -------------------------------------------------------------------
@@ -110,43 +151,66 @@ def update_dc008_calc(
     *,
     name: Optional[str] = None,
     data: Optional[Dict[str, Any]] = None,
+    design_id: Optional[str] = None,
 ) -> bool:
     sets: List[str] = []
     params: Dict[str, Any] = {"id": calc_id, "uid": user_id}
+    bind_json = False
+
     if name is not None:
         params["name"] = (name or "DC008").strip() or "DC008"
         sets.append("name = :name")
     if data is not None:
         params["data"] = data
         sets.append("data = :data")
-    if not sets:
-        return False
+        bind_json = True
 
-    sql = f"""
-        UPDATE {TABLE}
-        SET {", ".join(sets)}
-        WHERE id = :id AND user_id = :uid
-    """
     with connect() as conn:
-        # Fetch old name so audit can always show something meaningful
-        old = conn.execute(
-            text(f"SELECT name FROM {TABLE} WHERE id = :id AND user_id = :uid"),
-            {"id": calc_id, "uid": user_id},
-        ).mappings().one_or_none()
-        old_name = old["name"] if old else None
+        if design_id is not None and _has_design_id(conn):
+            params["design_id"] = design_id
+            sets.append("design_id = :design_id")
 
-        res = conn.execute(text(sql), params)
-        ok = (res.rowcount or 0) > 0
+        if not sets:
+            return False
+
+        sql = f"""
+            UPDATE {TABLE}
+            SET {", ".join(sets)}, updated_at = now()
+            WHERE id = :id AND user_id = :uid
+        """
+        stmt = text(sql)
+        if bind_json:
+            stmt = stmt.bindparams(bindparam("data", type_=JSONB))
+
+        # Fetch old name for robust audit logging
+        try:
+            old_name = conn.execute(
+                text(f"SELECT name FROM {TABLE} WHERE id = :id AND user_id = :uid"),
+                {"id": calc_id, "uid": user_id},
+            ).scalar()
+        except Exception:
+            old_name = None
+
+        # Try JSONB bind; fallback to text cast if needed
+        try:
+            res = conn.execute(stmt, params)
+            ok = (res.rowcount or 0) > 0
+        except (ProgrammingError, DBAPIError, TypeError):
+            if "data" in params:
+                params = dict(params)
+                params["data_text"] = json.dumps(params.pop("data"))
+                stmt = text(sql.replace("data = :data", "data = (:data_text)::jsonb"))
+            res = conn.execute(stmt, params)
+            ok = (res.rowcount or 0) > 0
 
         if ok:
             try:
                 nm_for_log = params.get("name", old_name)
-                log_on_conn(conn, "UPDATE", ENTITY, entity_id=calc_id, name=nm_for_log)
+                log_on_conn(conn, "update", ENTITY, entity_id=calc_id, name=nm_for_log)
             except Exception:
                 pass
 
         return ok
-
 
 def delete_dc008_calc(calc_id: str, user_id: str) -> bool:
     sql = f"DELETE FROM {TABLE} WHERE id = :id AND user_id = :uid"
@@ -165,7 +229,7 @@ def delete_dc008_calc(calc_id: str, user_id: str) -> bool:
 
         if ok:
             try:
-                log_on_conn(conn, "DELETE", ENTITY, entity_id=calc_id, name=name_before)
+                log_on_conn(conn, "delete", ENTITY, entity_id=calc_id, name=name_before)
             except Exception:
                 pass
 
